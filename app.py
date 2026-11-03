@@ -25,12 +25,16 @@ Deploy:
   Netlify static hosting cannot run Python / yt-dlp.
 """
 
-from flask import Flask, request, jsonify, send_file, abort
+from flask import Flask, request, jsonify, send_file, abort, redirect
 from flask_cors import CORS
 import yt_dlp
 import os
+import re
+import json
 import tempfile
 import uuid
+import urllib.request
+import urllib.error
 
 app = Flask(__name__)
 CORS(app)  # frontend on another domain can call this API
@@ -70,6 +74,64 @@ def get_info(url):
         return ydl.extract_info(url, download=False)
 
 
+def youtube_id_from_url(url):
+    # youtu.be/ID, youtube.com/watch?v=ID, /shorts/ID, /embed/ID, /v/ID
+    m = re.search(r"(?:v=|/shorts/|/embed/|/v/|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
+
+
+INVIDIOUS_INSTANCES = [
+    "https://yewtu.be",
+    "https://inv.nadeko.net",
+    "https://invidious.privacyredirect.com",
+    "https://vid.priv.au",
+    "https://iv.melmac.space",
+]
+
+
+def try_invidious(video_id):
+    """Fallback when yt-dlp is blocked by YouTube's bot check on a cloud IP.
+    Invidious is a public YouTube frontend API; it often still returns
+    formatStreams for a video even when yt-dlp from a datacenter IP fails.
+    Returns None if every instance fails."""
+    for base in INVIDIOUS_INSTANCES:
+        try:
+            req = urllib.request.Request(
+                f"{base}/api/v1/videos/{video_id}",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8", "ignore"))
+            streams = data.get("formatStreams") or []
+            if not streams:
+                continue
+            formats = []
+            for s in streams:
+                if s.get("url"):
+                    formats.append({
+                        "format_id": s.get("itag"),
+                        "ext": "mp4" if "mp4" in (s.get("type") or "") else "webm",
+                        "resolution": s.get("qualityLabel") or s.get("resolution"),
+                        "filesize": None,
+                        "url": s.get("url"),
+                    })
+            if formats:
+                return {
+                    "title": data.get("title"),
+                    "uploader": data.get("author"),
+                    "duration": data.get("lengthSeconds"),
+                    "thumbnail": (data.get("videoThumbnails") or [{}])[0].get("url") if data.get("videoThumbnails") else None,
+                    "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
+                    "formats": formats,
+                    "direct_url": formats[-1]["url"],
+                    "source": "invidious",
+                    "source_instance": base,
+                }
+        except Exception:
+            continue
+    return None
+
+
 @app.route("/api/info", methods=["GET"])
 def info():
     url = request.args.get("url", "").strip()
@@ -79,8 +141,14 @@ def info():
         data = get_info(url)
     except Exception as e:
         msg = str(e)
+        # Fallback: if this is a YouTube link blocked by bot check, try Invidious
+        vid = youtube_id_from_url(url)
+        if vid:
+            inv = try_invidious(vid)
+            if inv:
+                return jsonify(inv)
         if "bot" in msg.lower() or "sign in" in msg.lower() or "confirm" in msg.lower():
-            return jsonify({"error": "YouTube blocked this server request (bot check). Try again in a few minutes, or try a direct video file link. The video itself exists - this is a platform block on the server IP, not a broken link."}), 502
+            return jsonify({"error": "YouTube blocked this server request (bot check) and Invidious fallback also failed. Try again in a few minutes, or try a direct video file link. The video itself exists - this is a platform block on the server IP, not a broken link."}), 502
         return jsonify({"error": f"Could not read this video: {msg}"}), 400
 
     formats = []
@@ -130,8 +198,15 @@ def download():
             ydl.download([url])
     except Exception as e:
         msg = str(e)
+        vid = youtube_id_from_url(url)
+        if vid:
+            inv = try_invidious(vid)
+            if inv and inv.get("direct_url"):
+                # Redirect the browser straight to the stream file.
+                # This avoids downloading through the blocked server IP.
+                return redirect(inv["direct_url"], code=302)
         if "bot" in msg.lower() or "sign in" in msg.lower():
-            return jsonify({"error": "YouTube blocked this server request (bot check). Try again later, or use a direct video file link."}), 502
+            return jsonify({"error": "YouTube blocked this server request (bot check) and Invidious fallback also failed. Try again later, or use a direct video file link."}), 502
         return jsonify({"error": f"Download failed: {msg}"}), 400
 
     files = [os.path.join(tmpdir, f) for f in os.listdir(tmpdir)]
