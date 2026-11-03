@@ -80,6 +80,38 @@ def youtube_id_from_url(url):
     return m.group(1) if m else None
 
 
+def try_cobalt(video_url):
+    """Cobalt fallback: Cobalt (cobalt.tools) is a public, free downloader
+    service that extracts videos on its own servers. If yt-dlp and
+    Invidious both fail from our server IP, Cobalt often still works
+    because it maintains its own extraction infrastructure.
+    Returns {'direct_url': ..., 'source': 'cobalt'} or None."""
+    try:
+        payload = json.dumps({
+            "url": video_url,
+            "downloadMode": "auto",
+            "filenameStyle": "basic",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.cobalt.tools/",
+            data=payload,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+        if data.get("status") in ("tunnel", "redirect") and data.get("url"):
+            return {"direct_url": data["url"], "source": "cobalt"}
+        if data.get("status") == "picker" and data.get("picker"):
+            # Pick the first video item (not audio-only if possible)
+            for item in data["picker"]:
+                if item.get("url"):
+                    return {"direct_url": item["url"], "source": "cobalt"}
+    except Exception:
+        pass
+    return None
+
+
 INVIDIOUS_INSTANCES = [
     "https://yewtu.be",
     "https://inv.nadeko.net",
@@ -147,8 +179,20 @@ def info():
             inv = try_invidious(vid)
             if inv:
                 return jsonify(inv)
+            cob = try_cobalt(url)
+            if cob:
+                return jsonify({
+                    "title": None,
+                    "uploader": None,
+                    "duration": None,
+                    "thumbnail": None,
+                    "webpage_url": url,
+                    "formats": [{"format_id": "cobalt", "ext": "mp4", "resolution": None, "filesize": None, "url": cob["direct_url"]}],
+                    "direct_url": cob["direct_url"],
+                    "source": "cobalt",
+                })
         if "bot" in msg.lower() or "sign in" in msg.lower() or "confirm" in msg.lower():
-            return jsonify({"error": "YouTube blocked this server request (bot check) and Invidious fallback also failed. Try again in a few minutes, or try a direct video file link. The video itself exists - this is a platform block on the server IP, not a broken link."}), 502
+            return jsonify({"error": "YouTube blocked this server request (bot check) and Invidious + Cobalt fallbacks also failed. Try again in a few minutes, or try a direct video file link. The video itself exists - this is a platform block on the server IP, not a broken link."}), 502
         return jsonify({"error": f"Could not read this video: {msg}"}), 400
 
     formats = []
@@ -205,8 +249,11 @@ def download():
                 # Redirect the browser straight to the stream file.
                 # This avoids downloading through the blocked server IP.
                 return redirect(inv["direct_url"], code=302)
+            cob = try_cobalt(url)
+            if cob and cob.get("direct_url"):
+                return redirect(cob["direct_url"], code=302)
         if "bot" in msg.lower() or "sign in" in msg.lower():
-            return jsonify({"error": "YouTube blocked this server request (bot check) and Invidious fallback also failed. Try again later, or use a direct video file link."}), 502
+            return jsonify({"error": "YouTube blocked this server request (bot check) and Invidious + Cobalt fallbacks also failed. Try again later, or use a direct video file link."}), 502
         return jsonify({"error": f"Download failed: {msg}"}), 400
 
     files = [os.path.join(tmpdir, f) for f in os.listdir(tmpdir)]
